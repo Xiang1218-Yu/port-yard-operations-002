@@ -5,7 +5,7 @@ export type AppointmentStatus = 'booked' | 'checked-in' | 'completed' | 'cancell
 
 export interface Voyage { id: string; vessel: string; imo: string; service: string; eta: string; etd: string; status: 'approaching' | 'berthed' | 'loading' | 'departed'; berth: string; movesPlanned: number; movesDone: number; lateRisk: 'low' | 'medium' | 'high'; }
 export interface Container { id: string; voyageId: string; size: '20' | '40' | '45'; isoType: string; direction: 'import' | 'export' | 'transshipment'; status: ContainerStatus; weightT: number; reefer: boolean; temperature?: number; hazmatClass?: string; customs: 'released' | 'inspection' | 'hold'; priority: 'normal' | 'hot' | 'reefer' | 'hazmat'; yardSlot: string; appointmentId?: string; lastEvent: string; }
-export interface YardBlock { id: string; zone: string; rows: number; tiers: number; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; equipment: EquipmentKind[]; heat: number; }
+export interface YardBlock { id: string; zone: string; rows: number; tiers: number; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; customsHold?: boolean; gateMinutes?: number; equipment: EquipmentKind[]; heat: number; }
 export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; exception?: string; }
 export interface Equipment { id: string; name: string; kind: EquipmentKind; status: 'available' | 'working' | 'maintenance' | 'offline'; location: string; battery: number; queue: number; movesPerHour: number; }
 export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; }
@@ -18,10 +18,10 @@ export const voyages: Voyage[] = [
   { id: 'VOY-RD8', vessel: 'ONE Redwood', imo: 'IMO9812340', service: 'PNW', eta: iso(-700), etd: iso(-330), status: 'departed', berth: 'B02', movesPlanned: 520, movesDone: 520, lateRisk: 'low' }
 ];
 export const blocks: YardBlock[] = [
-  { id: 'A01', zone: 'North Import', rows: 14, tiers: 5, capacity: 280, occupied: 247, reeferPlugs: 18, usedPlugs: 16, hazmatAllowed: false, equipment: ['yard-crane', 'terminal-truck'], heat: 78 },
-  { id: 'B07', zone: 'Central Transshipment', rows: 18, tiers: 5, capacity: 360, occupied: 302, reeferPlugs: 24, usedPlugs: 19, hazmatAllowed: true, equipment: ['yard-crane', 'reach-stacker', 'terminal-truck'], heat: 91 },
-  { id: 'C03', zone: 'Export Pre-staging', rows: 12, tiers: 4, capacity: 192, occupied: 128, reeferPlugs: 8, usedPlugs: 3, hazmatAllowed: false, equipment: ['yard-crane', 'terminal-truck'], heat: 54 },
-  { id: 'D05', zone: 'Inspection & Hold', rows: 8, tiers: 3, capacity: 96, occupied: 72, reeferPlugs: 5, usedPlugs: 4, hazmatAllowed: true, equipment: ['reach-stacker'], heat: 63 }
+  { id: 'A01', zone: 'North Import', rows: 14, tiers: 5, capacity: 280, occupied: 247, reeferPlugs: 18, usedPlugs: 16, hazmatAllowed: false, gateMinutes: 12, equipment: ['yard-crane', 'terminal-truck'], heat: 78 },
+  { id: 'B07', zone: 'Central Transshipment', rows: 18, tiers: 5, capacity: 360, occupied: 302, reeferPlugs: 24, usedPlugs: 19, hazmatAllowed: true, gateMinutes: 8, equipment: ['yard-crane', 'reach-stacker', 'terminal-truck'], heat: 91 },
+  { id: 'C03', zone: 'Export Pre-staging', rows: 12, tiers: 4, capacity: 192, occupied: 128, reeferPlugs: 8, usedPlugs: 3, hazmatAllowed: false, gateMinutes: 6, equipment: ['yard-crane', 'terminal-truck'], heat: 54 },
+  { id: 'D05', zone: 'Inspection & Hold', rows: 8, tiers: 3, capacity: 96, occupied: 72, reeferPlugs: 5, usedPlugs: 4, hazmatAllowed: true, customsHold: true, gateMinutes: 15, equipment: ['reach-stacker'], heat: 63 }
 ];
 export const containers: Container[] = [
   { id: 'MSCU-4829017', voyageId: 'VOY-AX7', size: '40', isoType: '45G1', direction: 'import', status: 'in-yard', weightT: 22.4, reefer: false, customs: 'released', priority: 'hot', yardSlot: 'A01-R07-T3', lastEvent: '卸船完成 08:42' },
@@ -80,6 +80,161 @@ export function containerPlan(containerId: string) {
   return { container, recommendedBlock: selected, alternatives: ranked.slice(1, 3).map(item => item.block), reasons };
 }
 export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) })).sort((a, b) => b.score - a.score); }
+
+// ---- 堆位方案工作台：多候选方案、容量预留、锁定/取消与失效重规划 ----
+export type PlanStatus = 'draft' | 'locked' | 'cancelled' | 'invalidated';
+export interface ConstraintHit { key: string; label: string; hard: boolean; passed: boolean; detail: string; }
+export interface PlanCandidate { id: string; blockId: string; slot: string; score: number; constraintHits: ConstraintHit[]; cost: { travelMinutes: number; rehandles: number; plugContention: number; total: number }; risks: string[]; }
+export interface SlotPlan { id: string; containerId: string; targetVoyageId?: string; etaPickup?: string; fingerprint: string; status: PlanStatus; candidates: PlanCandidate[]; lockedCandidateId?: string; taskId?: string; createdAt: string; note?: string; }
+export interface SlotReservation { id: string; planId: string; containerId: string; blockId: string; reefer: boolean; createdAt: string; }
+export const slotPlans: SlotPlan[] = [];
+export const slotReservations: SlotReservation[] = [];
+
+// 约束相关字段的指纹：冷藏/危险品/海关/航次等变化后旧方案必须失效
+function planFingerprint(container: Container) {
+  return JSON.stringify([container.reefer, container.temperature ?? null, container.hazmatClass ?? '', container.customs, container.size, container.direction, container.voyageId]);
+}
+// 已锁定方案占用的容量/冷插，候选生成时必须扣除，避免同一容量被重复占用
+function effectiveUsage(blockId: string) {
+  const reserved = slotReservations.filter(r => r.blockId === blockId);
+  return { slots: reserved.length, plugs: reserved.filter(r => r.reefer).length };
+}
+const directionZones: Record<Container['direction'], RegExp> = { import: /Import/i, export: /Export/i, transshipment: /Transshipment/i };
+
+export function generateSlotPlan(input: { containerId: string; targetVoyageId?: string; etaPickup?: string }) {
+  const container = containers.find(c => c.id === input.containerId);
+  if (!container) throw new Error('箱号不存在');
+  if (input.targetVoyageId && !voyages.some(v => v.id === input.targetVoyageId)) throw new Error('目标航次不存在');
+  if (input.etaPickup && Number.isNaN(new Date(input.etaPickup).getTime())) throw new Error('预计提箱时间格式无效');
+  for (const plan of slotPlans.filter(p => p.containerId === container.id && p.status === 'draft')) { plan.status = 'invalidated'; plan.note = '已被新的规划取代，请使用最新方案'; }
+  const pickup = input.etaPickup ? new Date(input.etaPickup).getTime() : undefined;
+  const urgent = pickup !== undefined && pickup - Date.now() < 2 * 3600_000;
+  const planId = `PLAN-${Date.now()}-${slotPlans.length + 1}`;
+  const candidates: PlanCandidate[] = [];
+  for (const block of blocks) {
+    const usage = effectiveUsage(block.id);
+    const freeSlots = block.capacity - block.occupied - usage.slots;
+    const freePlugs = block.reeferPlugs - block.usedPlugs - usage.plugs;
+    const machines = equipment.filter(item => block.equipment.includes(item.kind) && (item.status === 'available' || item.status === 'working'));
+    const utilization = (block.occupied + usage.slots) / block.capacity;
+    const rehandles = Math.round(utilization * block.tiers * 0.5);
+    const queue = machines.length ? Math.min(...machines.map(m => m.queue)) : 5;
+    const travelMinutes = (block.gateMinutes ?? 10) + queue * 2;
+    const plugContention = container.reefer ? Math.max(0, 3 - freePlugs) : 0;
+    const constraintHits: ConstraintHit[] = [
+      { key: 'capacity', label: '容量', hard: true, passed: freeSlots > 0, detail: `剩余 ${freeSlots} TEU（含 ${usage.slots} 个已锁定预留）` },
+      { key: 'reefer', label: '冷藏插座', hard: container.reefer, passed: !container.reefer || freePlugs > 0, detail: container.reefer ? `剩余冷插 ${freePlugs} 个（含预留占用）` : '普通箱，无需冷插' },
+      { key: 'hazmat', label: '危险品隔离', hard: Boolean(container.hazmatClass), passed: !container.hazmatClass || block.hazmatAllowed, detail: container.hazmatClass ? (block.hazmatAllowed ? `${container.hazmatClass} 类隔离资质满足` : '区块无危险品隔离资质') : '非危险品，无隔离要求' },
+      { key: 'customs', label: '海关监管', hard: container.customs !== 'released', passed: container.customs === 'released' || Boolean(block.customsHold), detail: container.customs === 'released' ? '海关已放行，无监管区限制' : `海关${container.customs === 'inspection' ? '查验中' : '扣留'}，须进查验/监管区` },
+      { key: 'equipment', label: '设备可达', hard: false, passed: machines.length > 0, detail: machines.length ? `${machines.map(m => m.name).join('、')} 可调度` : '区块设备均不可用，需跨区调度' },
+      { key: 'direction', label: '流向匹配', hard: false, passed: directionZones[container.direction].test(block.zone), detail: `${container.direction === 'import' ? '进口' : container.direction === 'export' ? '出口' : '中转'}流向与 ${block.zone} ${directionZones[container.direction].test(block.zone) ? '匹配' : '不匹配'}` }
+    ];
+    if (input.targetVoyageId) {
+      const voyage = voyages.find(v => v.id === input.targetVoyageId)!;
+      constraintHits.push({ key: 'voyage', label: '目标航次', hard: false, passed: voyage.status !== 'departed', detail: `${voyage.vessel} ETD ${voyage.etd.slice(11, 16)}，${voyage.status === 'departed' ? '已离港，需改配航次' : '可按船期预配'}` });
+    }
+    if (pickup !== undefined) constraintHits.push({ key: 'pickup', label: '提箱时效', hard: false, passed: !urgent || rehandles <= 2, detail: urgent ? `提箱在即（2 小时内），预计翻箱 ${rehandles} 次` : `提箱时间充裕，预计翻箱 ${rehandles} 次` });
+    if (constraintHits.some(hit => hit.hard && !hit.passed)) continue;
+    let score = 100 - travelMinutes * 1.2 - rehandles * 4 - plugContention * 6;
+    if (!constraintHits.find(hit => hit.key === 'equipment')!.passed) score -= 15;
+    if (!constraintHits.find(hit => hit.key === 'direction')!.passed) score -= 10;
+    const pickupHit = constraintHits.find(hit => hit.key === 'pickup');
+    if (pickupHit && !pickupHit.passed) score -= 12;
+    const risks: string[] = [];
+    if (block.heat > 85) risks.push('区块热度临界，高峰时段可能排队');
+    if (utilization > 0.9) risks.push('容量接近饱和，后续翻箱概率高');
+    if (container.reefer && freePlugs < 3) risks.push(`冷插余量仅 ${freePlugs} 个`);
+    if (!machines.length) risks.push('区块设备不可用，需跨区调度');
+    const slotSeq = block.occupied + usage.slots;
+    candidates.push({
+      id: `${planId}-C${candidates.length + 1}`, blockId: block.id,
+      slot: `${block.id}-R${String(slotSeq % block.rows + 1).padStart(2, '0')}-T${slotSeq % block.tiers + 1}`,
+      score: Math.round(score), constraintHits,
+      cost: { travelMinutes, rehandles, plugContention, total: travelMinutes + rehandles * 3 + plugContention * 5 },
+      risks
+    });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  candidates.forEach((candidate, index) => { candidate.id = `${planId}-C${index + 1}`; });
+  const plan: SlotPlan = { id: planId, containerId: container.id, targetVoyageId: input.targetVoyageId, etaPickup: input.etaPickup, fingerprint: planFingerprint(container), status: 'draft', candidates, createdAt: new Date().toISOString(), ...(candidates.length ? {} : { note: '没有同时满足容量、冷藏、危险品与海关硬约束的可执行区块' }) };
+  slotPlans.unshift(plan);
+  recordAudit('PLAN_GENERATE', 'slot-plan', plan.id, `为 ${container.id} 生成 ${candidates.length} 个候选方案`);
+  return plan;
+}
+
+export function lockSlotPlan(planId: string, candidateId: string) {
+  const plan = slotPlans.find(p => p.id === planId);
+  if (!plan) return undefined;
+  if (plan.status !== 'draft') throw new Error(`方案当前状态为 ${plan.status}，不能锁定`);
+  const container = containers.find(c => c.id === plan.containerId);
+  if (!container) throw new Error('关联箱号不存在');
+  if (planFingerprint(container) !== plan.fingerprint) { plan.status = 'invalidated'; plan.note = '箱关键属性已变化，方案自动失效'; throw new Error('箱约束属性已变化，方案失效，请重新规划'); }
+  const candidate = plan.candidates.find(c => c.id === candidateId);
+  if (!candidate) throw new Error('候选方案不存在');
+  const block = blocks.find(b => b.id === candidate.blockId);
+  if (!block) throw new Error('候选区块不存在');
+  const usage = effectiveUsage(block.id);
+  const hardFail = block.capacity - block.occupied - usage.slots <= 0
+    || (container.reefer && block.reeferPlugs - block.usedPlugs - usage.plugs <= 0)
+    || (container.hazmatClass && !block.hazmatAllowed)
+    || (container.customs !== 'released' && !block.customsHold);
+  if (hardFail) { plan.status = 'invalidated'; plan.note = '锁定前复核发现容量/约束已变化'; throw new Error('区块容量或约束条件已变化，方案失效，请重新规划'); }
+  slotReservations.push({ id: `RSV-${Date.now()}-${slotReservations.length + 1}`, planId: plan.id, containerId: container.id, blockId: block.id, reefer: container.reefer, createdAt: new Date().toISOString() });
+  const kind = container.status === 'in-yard' || container.status === 'hold' ? 'rehandle' : 'receive';
+  const priority = { hot: 90, hazmat: 85, reefer: 80, normal: 60 }[container.priority];
+  const task = createYardTask({ kind, containerId: container.id, from: container.yardSlot, to: candidate.slot, priority, scheduledAt: new Date().toISOString(), estimatedMinutes: candidate.cost.travelMinutes + 6 });
+  plan.status = 'locked'; plan.lockedCandidateId = candidate.id; plan.taskId = task.id;
+  recordAudit('PLAN_LOCK', 'slot-plan', plan.id, `锁定 ${block.id} 候选位 ${candidate.slot}，预留容量并创建任务 ${task.id}`);
+  return plan;
+}
+
+function releasePlanReservation(plan: SlotPlan, reason: string) {
+  const index = slotReservations.findIndex(r => r.planId === plan.id);
+  if (index >= 0) slotReservations.splice(index, 1);
+  if (plan.taskId) {
+    const taskIndex = tasks.findIndex(t => t.id === plan.taskId);
+    const task = tasks[taskIndex];
+    if (task && task.status !== 'done' && task.status !== 'executing') tasks.splice(taskIndex, 1);
+    else if (task && task.status !== 'done') { task.status = 'blocked'; task.blockingReasons = [...task.blockingReasons, reason]; }
+  }
+}
+
+export function cancelSlotPlan(planId: string) {
+  const plan = slotPlans.find(p => p.id === planId);
+  if (!plan) return undefined;
+  if (plan.status === 'cancelled' || plan.status === 'invalidated') return plan;
+  if (plan.status === 'locked') releasePlanReservation(plan, '方案已取消，容量预留已释放');
+  plan.status = 'cancelled'; plan.note = '调度员取消方案，占用预留已恢复';
+  recordAudit('PLAN_CANCEL', 'slot-plan', plan.id, `取消 ${plan.containerId} 的堆位方案并释放预留`);
+  return plan;
+}
+
+export function invalidateContainerPlans(containerId: string, reason: string) {
+  const affected = slotPlans.filter(p => p.containerId === containerId && (p.status === 'draft' || p.status === 'locked'));
+  for (const plan of affected) {
+    if (plan.status === 'locked') releasePlanReservation(plan, reason);
+    plan.status = 'invalidated'; plan.note = `${reason}，请重新规划`;
+  }
+  if (affected.length) recordAudit('PLAN_INVALIDATE', 'container', containerId, `${reason}，${affected.length} 个方案失效`);
+  return affected.length;
+}
+
+// 任务完成时把锁定预留转为实际堆存，容量口径保持一致
+function settleLockedPlan(task: YardTask) {
+  const plan = slotPlans.find(p => p.taskId === task.id && p.status === 'locked');
+  if (!plan) return;
+  const index = slotReservations.findIndex(r => r.planId === plan.id);
+  if (index < 0) return;
+  const [reservation] = slotReservations.splice(index, 1);
+  const block = blocks.find(b => b.id === reservation.blockId);
+  if (block) { block.occupied = Math.min(block.capacity, block.occupied + 1); if (reservation.reefer) block.usedPlugs = Math.min(block.reeferPlugs, block.usedPlugs + 1); }
+  const container = containers.find(c => c.id === plan.containerId);
+  if (container) { container.yardSlot = task.to; container.status = 'in-yard'; }
+  plan.note = '任务完成，预留已转为实际堆存';
+  recordAudit('PLAN_SETTLE', 'slot-plan', plan.id, `任务 ${task.id} 完成，预留容量转为实际占用`);
+}
+
+export function listSlotPlans(containerId?: string) { return slotPlans.filter(p => !containerId || p.containerId === containerId); }
 export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
   const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
@@ -87,7 +242,7 @@ export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' |
 }
 export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
 export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
-export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
+export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), slotPlans: listSlotPlans(id), tasks: tasks.filter(t => t.containerId === id) }; }
 
 export type ContainerInput = Omit<Container, 'lastEvent' | 'appointmentId'> & { appointmentId?: string };
 export type AppointmentInput = Pick<GateAppointment, 'containerId' | 'truckNo' | 'driver' | 'type' | 'windowStart' | 'windowEnd' | 'lane'>;
@@ -123,7 +278,9 @@ export function updateContainer(id: string, patch: Partial<Omit<Container, 'id' 
   const blockId = parseSlot(next.yardSlot);
   if (blockId && !blocks.some(block => block.id === blockId)) throw new Error('堆位所属区块不存在');
   if (next.hazmatClass && blockId && !blocks.find(block => block.id === blockId)?.hazmatAllowed) throw new Error('危险品不能进入当前堆场区块');
+  const fingerprintBefore = planFingerprint(item);
   Object.assign(item, patch, { lastEvent: `台账更新 ${new Date().toLocaleString()}` });
+  if (planFingerprint(item) !== fingerprintBefore) invalidateContainerPlans(id, '冷藏/危险品/海关/航次等关键属性变化');
   recordAudit('UPDATE', 'container', id, '更新集装箱台账字段');
   return item;
 }
@@ -136,6 +293,7 @@ export function deleteContainer(id: string) {
   for (const appointment of removedAppointments) appointments.splice(appointments.indexOf(appointment), 1);
   const removedTasks = tasks.filter(task => task.containerId === id);
   for (const task of removedTasks) tasks.splice(tasks.indexOf(task), 1);
+  invalidateContainerPlans(id, '箱务记录已删除');
   recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${removedTasks.length} 条未完成任务`);
   return item;
 }
@@ -194,6 +352,7 @@ export function updateYardTask(id: string, patch: Partial<TaskInput & Pick<YardT
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('关联箱号不存在');
   if (patch.priority !== undefined && (patch.priority < 1 || patch.priority > 100)) throw new Error('优先级范围为 1–100');
   Object.assign(item, patch);
+  if (item.status === 'done') settleLockedPlan(item);
   recordAudit('UPDATE', 'yard-task', id, `更新场内作业任务：${JSON.stringify(patch)}`);
   return item;
 }
