@@ -22,3 +22,45 @@ test('appointment and task domain operations support create, update and delete',
   assert.equal(updateYardTask(task.id, { to: '北闸口' })?.to, '北闸口');
   assert.equal(deleteYardTask(task.id)?.id, task.id);
 });
+
+test('slot plan workbench generates multiple explainable candidates', async () => {
+  const { generateSlotPlan } = await import('./domain.js');
+  const session = generateSlotPlan({ containerId: 'MSCU-4829017' });
+  assert.ok(session.candidates.length >= 3);
+  assert.ok(session.candidates.every(c => c.constraints.length >= 6 && c.cost.breakdown.length >= 2));
+  const hazmat = generateSlotPlan({ containerId: 'TGHU-9831204' });
+  assert.ok(hazmat.candidates.some(c => !c.feasible && c.constraints.some(item => item.key === 'hazmat' && item.status === 'fail')));
+  assert.ok(hazmat.candidates.some(c => c.constraints.some(item => item.key === 'customs' && item.status === 'pass')));
+  assert.ok(hazmat.candidates.some(c => c.constraints.some(item => item.key === 'equipment' && item.status === 'fail')));
+});
+
+test('locking reserves capacity, rejects double booking and unlock restores it', async () => {
+  const { generateSlotPlan, lockSlotPlan, unlockSlotPlan, slotReservations, tasks } = await import('./domain.js');
+  const first = generateSlotPlan({ containerId: 'MSCU-4829017' });
+  const second = generateSlotPlan({ containerId: 'CMAU-6001722' });
+  const firstCandidate = first.candidates.find(c => c.feasible)!;
+  const clash = second.candidates.find(c => c.slot === firstCandidate.slot)!;
+  const locked = lockSlotPlan(first.id, firstCandidate.id);
+  assert.equal(locked?.status, 'locked');
+  const createdTaskId = locked!.createdTaskId!;
+  assert.ok(slotReservations.some(r => r.slot === firstCandidate.slot));
+  assert.ok(tasks.some(t => t.id === createdTaskId && t.to === firstCandidate.slot));
+  assert.throws(() => lockSlotPlan(second.id, clash.id), /占用/);
+  const reopened = unlockSlotPlan(first.id);
+  assert.equal(reopened?.status, 'open');
+  assert.equal(slotReservations.some(r => r.slot === firstCandidate.slot), false);
+  assert.equal(tasks.find(t => t.id === createdTaskId)?.status, 'blocked');
+});
+
+test('reefer or hazmat changes invalidate plans and release reservations', async () => {
+  const { createContainer, deleteContainer, generateSlotPlan, lockSlotPlan, updateContainer, listPlanSessions, slotReservations } = await import('./domain.js');
+  createContainer({ id: 'TEST-PLAN-0001', voyageId: 'VOY-AX7', size: '40', isoType: '45G1', direction: 'import', status: 'in-yard', weightT: 20, reefer: false, customs: 'released', priority: 'normal', yardSlot: 'C03-R09-T1' });
+  const session = generateSlotPlan({ containerId: 'TEST-PLAN-0001' });
+  lockSlotPlan(session.id, session.candidates.find(c => c.feasible)!.id);
+  updateContainer('TEST-PLAN-0001', { reefer: true, temperature: -18 });
+  const invalidated = listPlanSessions().find(item => item.id === session.id);
+  assert.equal(invalidated?.status, 'invalidated');
+  assert.ok(invalidated?.invalidReason?.includes('冷藏'));
+  assert.equal(slotReservations.some(r => r.sessionId === session.id), false);
+  deleteContainer('TEST-PLAN-0001');
+});
